@@ -30,30 +30,39 @@ from time import time, mktime
 from datetime import datetime
 
 
-class KeystoneAuth(object):
+class AuthProtocol(object):
     """
-    Keystone authentication and authorization system.
+    Keystone to Swift authentication and authorization system.
 
     Add to your pipeline in proxy-server.conf, such as::
 
         [pipeline:main]
-        pipeline = catch_errors cache keystone2 proxy-server
+        pipeline = catch_errors cache keystone proxy-server
 
     Set account auto creation to true::
 
         [app:proxy-server]
         account_autocreate = true
 
-    And add a keystone2 filter section, such as::
+    And add a keystone filter section, such as::
 
-        [filter:keystone2]
-        use = egg:swiftkeystone2#keystone2
-        keystone_admin_token = admin_token
+        [filter:keystone]
+        use = egg:keystone#swiftauth
         keystone_url = http://keystone_url:5000/v2.0
+        keystone_admin_token = admin_token
         keystone_admin_group = Admin
 
-    This middleware handle ACL as well and allow Keystone groups to
-    map to swift ACL.
+    This maps tenants to account in Swift. The user who's able to give
+    ACL / Create Containers permision will be the same user as the account.
+
+    Example: If we have the account called hellocorp with a user
+    hellocorp that user will be admin on that account and can give ACL
+    to all other users for hellocorp.
+
+    If there is a user who has not the same name the account and if it
+    is inside the group (or roles in keystone lingua)
+    keystone_admin_group as specifed in the configuration variable
+    (Admin by default) it will be allowed to be an admin the account.
 
     :param app: The next WSGI app in the pipeline
     :param conf: The dict of configuration values
@@ -67,12 +76,13 @@ class KeystoneAuth(object):
         self.keystone_url = urlparse(conf.get('keystone_url'))
         self.keystone_admin_group = conf.get('keystone_admin_group', 'Admin')
         self.admin_token = conf.get('keystone_admin_token')
+        self.auth_timeout = conf.get('keystone_auth_timeout', 30)
         self.allowed_sync_hosts = [h.strip()
             for h in conf.get('allowed_sync_hosts', '127.0.0.1').split(',')
             if h.strip()]
 
     def __call__(self, environ, start_response):
-        self.logger.debug('Initialising keystone middleware')
+        self.logger.debug('Initialise keystone middleware')
 
         req = Request(environ)
         token = environ.get('HTTP_X_AUTH_TOKEN',
@@ -95,6 +105,7 @@ class KeystoneAuth(object):
                 identity = _identity
 
         if not identity:
+            self.logger.debug("No memcache, requesting it from keystone")
             identity = self._keystone_validate_token(token)
             if identity and memcache_client:
                 expires = identity['expires']
@@ -105,6 +116,8 @@ class KeystoneAuth(object):
                 self.logger.debug('setting memcache expiration to %s' % ts)
             else:  # if we didn't get identity it means there was an error.
                 return HTTPBadRequest(request=req)
+
+        self.logger.debug("Using identity: %r" % (identity))
 
         if not identity:
             #TODO: non authenticated access allow via refer
@@ -135,29 +148,33 @@ class KeystoneAuth(object):
                                 (self.keystone_url.path,
                                  quote(claim)),
                             headers=headers,
-                            ssl=(self.keystone_url.scheme == 'https'))
+                            ssl=(self.keystone_url.scheme == 'https'),
+                            timeout=self.auth_timeout)
         resp = conn.getresponse()
         data = resp.read()
         conn.close()
+        self.logger.debug("Keystone came back with: status:%d, data:%s" % \
+                            (resp.status, data))
 
         if not str(resp.status).startswith('20'):
             #TODO: Make the self.keystone_url more meaningfull
-            self.logger.debug('Error: Keystone : %s Returned: %d' % \
-                                  (self.keystone_url, resp.status))
-            return False
+            raise Exception('Error: Keystone : %s Returned: %d' % \
+                                (self.keystone_url, resp.status))
         identity_info = json.loads(data)
 
         try:
-            tenant = identity_info['access']['token']['tenant']['id']
+            tenant = (identity_info['access']['token']['tenant']['id'],
+                         identity_info['access']['token']['tenant']['name'])
             expires = self.convert_date(
                 identity_info['access']['token']['expires'])
-            user = identity_info['access']['user']['username']
+            user = 'username' in identity_info['access']['user'] and \
+                identity_info['access']['user']['username'] or \
+                identity_info['access']['user']['name']
             roles = [x['name'] for x in \
                          identity_info['access']['user']['roles']]
-        except(KeyError, IndexError):
-            return
+        except (KeyError, IndexError):
+            raise
 
-        #TODO: should handle the Nones
         identity = {'user': user,
                     'tenant': tenant,
                     'roles': roles,
@@ -176,16 +193,23 @@ class KeystoneAuth(object):
         except ValueError:
             return HTTPNotFound(request=req)
 
-        if account != '%s_%s' % (self.reseller_prefix, tenant):
+        if account != '%s_%s' % (self.reseller_prefix, tenant[0]):
             self.log.debug('tenant mismatch')
             return self.denied_response(req)
 
+        # If user is in admin group then make the owner of it.
         user_groups = env_identity.get('roles', [])
-        #TODO: setting?
         if self.keystone_admin_group in user_groups:
             req.environ['swift_owner'] = True
             return None
 
+        # If user is of the same name of the tenant then make owner of it.
+        user = env_identity.get('user', '')
+        if user == tenant[1]:
+            req.environ['swift_owner'] = True
+            return None
+
+        # Allow container sync
         if (req.environ.get('swift_sync_key') and
             req.environ['swift_sync_key'] ==
                 req.headers.get('x-container-sync-key', None) and
@@ -195,7 +219,7 @@ class KeystoneAuth(object):
             self.logger.debug('allowing container-sync')
             return None
 
-        # Check if Referrer allow it #TODO: check if it works
+        # Check if Referrer allow it
         referrers, groups = parse_acl(getattr(req, 'acl', None))
         if referrer_allowed(req.referer, referrers):
             if obj or '.rlistings' in groups:
@@ -203,13 +227,14 @@ class KeystoneAuth(object):
                 return None
             return self.denied_response(req)
 
-        # Check if we have the group in the group user and allow it
+        # Check if we have the group in the usergroups and allow it
         for user_group in user_groups:
             if user_group in groups:
                 self.logger.debug('user in group: %s authorizing' % \
                                       (user_group))
                 return None
 
+        # last but not least retun deny
         return self.denied_response(req)
 
     def denied_response(self, req):
@@ -229,5 +254,5 @@ def filter_factory(global_conf, **local_conf):
     conf.update(local_conf)
 
     def auth_filter(app):
-        return KeystoneAuth(app, conf)
+        return AuthProtocol(app, conf)
     return auth_filter
