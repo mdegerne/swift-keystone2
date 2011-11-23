@@ -81,7 +81,7 @@ class AuthProtocol(object):
         self.admin_token = conf.get('keystone_admin_token')
         self.auth_timeout = conf.get('keystone_auth_timeout', 30)
         self.keystone_tenant_user_admin = \
-            conf.get('keystone_tenant_user_admin', False).lower() in \
+            conf.get('keystone_tenant_user_admin', "false").lower() in \
             ('true', 't', '1', 'on', 'yes', 'y')
         self.allowed_sync_hosts = [h.strip()
             for h in conf.get('allowed_sync_hosts', '127.0.0.1').split(',')
