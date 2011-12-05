@@ -14,13 +14,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
+import time
 from setuptools import setup, find_packages
 name = 'swiftkeystone2'
-version = '0.1'
+
+TOPDIR = os.path.abspath(os.path.dirname(__file__))
+VFILE  = os.path.join(TOPDIR, name, '__pistonversion__.py')
+
+args = filter(lambda x: x[0] != '-', sys.argv)
+command = args[1] if len(args) > 1 else ''
+
+if command == 'sdist':
+    PISTON_VERSION = os.environ['PISTON_VERSION']
+    with file(VFILE, 'w') as f:
+        f.write('''#!/usr/bin/env python\nVERSION = '%s'\n''' % PISTON_VERSION)
+elif command == 'develop':
+    PISTON_VERSION = time.strftime('9999.0.%Y%m%d%H%M%S', time.localtime())
+    with file(VFILE, 'w') as f:
+        f.write('''#!/usr/bin/env python\nVERSION = '%s'\n''' % PISTON_VERSION)
+elif command is None:
+    PISTON_VERSION = '9999999999-You_did_not_set_a_version'
+else:
+    assert os.path.exists(VFILE), '%s does not exist, please run sdist or develop' % VFILE
+    from swiftkeystone2 import __pistonversion__ as pistonversion
+    PISTON_VERSION = pistonversion.VERSION
 
 setup(
     name=name,
-    version=version,
+    version=PISTON_VERSION,
     description='Swift Keystone2',
     license='Apache License (2.0)',
     author='Chmouel Boudjnah',
