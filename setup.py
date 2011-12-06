@@ -42,7 +42,7 @@ else:
     PISTON_VERSION = pistonversion.VERSION
 
 setup(
-    name=name,
+    name='swift-keystone2',
     version=PISTON_VERSION,
     description='Swift Keystone2',
     license='Apache License (2.0)',
